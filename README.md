@@ -1,5 +1,5 @@
 # Thesis
-This repository contains the research work conducted for Master thesis titled "Generation of human like comments using Large language models". 
+This repository contains the research work conducted for Master thesis titled "Analyzing narratives in the social housing domain using Large Language Models". 
 
 Objectives:
 
@@ -13,7 +13,6 @@ Key Findings:
 Usage:
 
 [Instructions on how to use or interact with the repository, if applicable]
-
 
 
 References:
