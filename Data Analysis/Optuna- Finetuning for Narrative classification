@@ -1,0 +1,153 @@
+# Import necessary packages
+import re
+from sklearn.model_selection import train_test_split
+import pandas as pd
+from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+import optuna
+import torch
+import numpy as np
+from sklearn.metrics import accuracy_score
+from transformers import Trainer, TrainingArguments, AutoModelForSequenceClassification, AutoTokenizer
+import warnings
+warnings.filterwarnings("ignore")
+
+#Read data using pandas library
+data = pd.read_csv(r"/data1/s3531643/thesis/Data/RIVM_labelled_corpus.csv")
+data.head(2)
+
+torch.cuda.empty_cache()
+
+#Preprocess all the text
+def preprocess(text):
+    #text = text.lower()
+    text = re.sub("\n"," ",text) #Remove all next lines
+    #text = re.sub(r'<[^>]+>',"",text) # remove all html markup
+    #text = re.sub('[^a-zèéeêëėęûüùúūôöòóõœøîïíīįìàáâäæãåçćč&@#A-ZÇĆČÉÈÊËĒĘÛÜÙÚŪÔÖÒÓŒØŌÕÎÏÍĪĮÌ0-9- \']', "", text) #Remove special characters
+    #text = re.sub("\?","question_mark",text) #Replace question mark as mentioned in the paper
+    #wrds = text.split()
+    return text
+
+# Drop any rows from the DataFrame data that contain missing values (NaN) and split the labels into a list of labels
+data = data.dropna()
+data["new labels"] = data["labels"].apply(lambda row:str(row).split(","))
+
+# Remove rows where labels occur only once
+value_counts = data["new labels"].value_counts()
+data = data[data['new labels'].isin(value_counts[value_counts != 1].index)]
+
+# Apply the preprocessing function to the data column
+data['content of post preprocessed'] = data['content of post'].apply(preprocess)
+
+# Convert data into numerical format
+mlb = MultiLabelBinarizer()
+y = mlb.fit_transform(list(data["new labels"]))
+
+data_list = list(data["content of post preprocessed"])
+
+# Split the dataset into training and testing sets
+train_texts, test_texts, train_labels, test_labels = train_test_split(data_list,y, test_size=0.2, stratify=y, random_state=42)
+
+tokenizer = AutoTokenizer.from_pretrained("DTAI-KULeuven/robbert-2023-dutch-large")
+
+# Tokenize the text data
+def tokenize_function(examples):
+    return tokenizer(examples,  padding="max_length", truncation=True, max_length=512, return_tensors="pt")
+
+train_encodings = tokenize_function(train_texts)
+test_encodings = tokenize_function(test_texts)
+
+
+# Prepare the dataset
+class CustomDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels):
+        self.encodings = encodings
+        self.labels = labels
+
+    def __getitem__(self, idx):
+        item = {key: val[idx].detach().clone() for key, val in self.encodings.items()}
+        item['labels'] = torch.tensor(self.labels[idx],dtype=torch.float32)
+        return item
+
+    def __len__(self):
+        return len(self.labels)
+
+train_dataset = CustomDataset(train_encodings, train_labels)
+test_dataset = CustomDataset(test_encodings, test_labels)
+
+def compute_metrics(pred):
+    labels = pred.label_ids
+    preds = (pred.predictions > 0.5).astype(int)
+    print(labels,preds)
+    precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average='micro')
+    acc = accuracy_score(labels, preds)
+    return {
+        'accuracy': acc,
+        'f1': f1,
+        'precision': precision,
+        'recall': recall
+    }
+
+
+def objective(trial):
+
+    torch.cuda.empty_cache()
+
+    # Define the search space for hyperparameters
+    params = {
+        "learning_rate": trial.suggest_loguniform('learning_rate', 5e-5, 1e-2),
+        "num_train_epochs": trial.suggest_int("num_train_epochs", 2, 5)
+    }
+
+    print(params)
+
+    # Instantiate the model and tokenizer
+    model_name = "DTAI-KULeuven/robbert-2023-dutch-large"
+    model = AutoModelForSequenceClassification.from_pretrained("DTAI-KULeuven/robbert-2023-dutch-large", num_labels=5,
+                                                         ignore_mismatched_sizes=True, problem_type="multi_label_classification")
+    tokenizer = AutoTokenizer.from_pretrained("DTAI-KULeuven/robbert-2023-dutch-large")
+
+
+    training_args = TrainingArguments(
+        output_dir='./results',          # output directory
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=2,
+        #num_train_epochs=1,
+        num_train_epochs=params["num_train_epochs"],
+        learning_rate=params["learning_rate"],
+        logging_dir='./logs',
+        logging_steps=1000,
+    )
+
+    trainer = Trainer(
+        model=model,                         # the instantiated 🤗 Transformers model to be trained
+        args=training_args,                  # training arguments, defined above
+        train_dataset=train_dataset  ,       # training dataset
+        eval_dataset = test_dataset,
+      compute_metrics = compute_metrics
+    )
+
+    # Train the model
+    trainer.train()
+
+    # Evaluate the model
+    eval_output = trainer.evaluate()
+    print(eval_output)
+
+    # Return the evaluation metric to be optimized
+    return eval_output["eval_f1"]
+
+# Create Optuna study object
+study = optuna.create_study(direction="maximize")
+
+# Run the optimization
+study.optimize(objective, n_trials=20)
+
+# Get the best parameters
+best_params = study.best_params
+print("Best Parameters:", best_params)
+
+for trial in study.trials:
+    print(f"Trial {trial.number}:")
+    print(f"  Params: {trial.params}")
+    print(f"  Value: {trial.value}")
